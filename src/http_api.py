@@ -71,7 +71,11 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            items = getattr(exc, "items", None)
+            if items:
+                payload["items"] = items
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -87,12 +91,29 @@ def create_handler(service, rules, static_dir):
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                query = parse_qs(parsed.query)
+                if parts == ["api", "eligibility"]:
+                    return self._send(
+                        200,
+                        service.eligibility_view(
+                            event=query.get("event", [None])[0],
+                            event_date=query.get("event_date", [None])[0],
+                            as_of=query.get("as_of", [None])[0],
+                        ),
+                    )
+                if parts == ["api", "registrations"]:
+                    return self._send(
+                        200,
+                        service.registrations_view(
+                            event=query.get("event", [None])[0],
+                            as_of=query.get("as_of", [None])[0],
+                        ),
+                    )
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
-                    query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
                     return self._send(
                         200,
@@ -137,6 +158,29 @@ def create_handler(service, rules, static_dir):
                     return self._send(
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
+                    )
+                if len(parts) == 2 and parts[0] == "api" and parts[1] == "registrations":
+                    body = self._body()
+                    action = body.pop("action", None)
+                    if action == "confirm":
+                        idem = self.headers.get("Idempotency-Key")
+                        return self._send(
+                            201,
+                            service.confirm_registration(
+                                actor, body.pop("data", body), idem
+                            ),
+                        )
+                    if action == "reconcile":
+                        return self._send(200, service.reconcile_registrations(actor))
+                    raise ValidationError("action must be confirm or reconcile")
+                if len(parts) == 3 and parts[:2] == ["api", "registrations"] and parts[2] == "confirm":
+                    idem = self.headers.get("Idempotency-Key")
+                    return self._send(201, service.confirm_registration(actor, self._body(), idem))
+                if len(parts) == 3 and parts[:2] == ["api", "registrations"] and parts[2] == "reconcile":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.reconcile_registrations(actor, event=body.get("event")),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()

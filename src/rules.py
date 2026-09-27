@@ -7,10 +7,39 @@ from .domain import (
     ValidationError,
 )
 
+SUBJECT_KINDS = ("athlete", "team", "personnel")
+PERSONNEL_ROLES = ("coach", "doctor")
+
+
+def _parse_date(value, field):
+    text = str(value or "")[:10]
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValidationError("%s must be a valid YYYY-MM-DD date" % field)
+
 
 def _validate_athlete(actor, data, lookup):
     if len(data.get("discipline", "")) < 2:
         raise ValidationError("discipline is too short")
+    team_id = data.get("team_id")
+    if team_id and not _find_one(lookup, "team", "id", team_id):
+        raise ValidationError("athlete requires an existing team_id")
+
+
+def _validate_team(actor, data, lookup):
+    if len(data.get("name", "")) < 2:
+        raise ValidationError("team name is too short")
+
+
+def _validate_personnel(actor, data, lookup):
+    team = _find_one(lookup, "team", "id", data.get("team_id"))
+    if not team or team["status"] != "active":
+        raise ValidationError("personnel requires an active team")
+    if data.get("role") not in PERSONNEL_ROLES:
+        raise ValidationError("personnel role must be coach or doctor")
+    if not data.get("name", "").strip():
+        raise ValidationError("personnel name is required")
 
 
 def _validate_sample(actor, data, lookup):
@@ -22,9 +51,25 @@ def _validate_sample(actor, data, lookup):
 
 
 def _validate_case(actor, data, lookup):
-    sample = _find_one(lookup, "sample", "id", data.get("sample_id"))
-    if not sample or sample["status"] != "adverse":
-        raise ValidationError("case requires an adverse sample")
+    subject_kind = data.get("subject_kind") or "athlete"
+    if subject_kind not in SUBJECT_KINDS:
+        raise ValidationError("subject_kind must be athlete, team or personnel")
+    subject_id = data.get("subject_id") or data.get("athlete_id")
+    if not subject_id:
+        raise ValidationError("subject_id is required")
+    subject = _find_one(lookup, subject_kind, "id", subject_id)
+    if not subject:
+        raise ValidationError("case requires an existing subject")
+    # Normalize case data onto the common subject_kind/subject_id fields.
+    data["subject_kind"] = subject_kind
+    data["subject_id"] = subject_id
+    data.setdefault("athlete_id", subject_id if subject_kind == "athlete" else None)
+    if subject_kind == "athlete":
+        sample = _find_one(lookup, "sample", "id", data.get("sample_id"))
+        if not sample or sample["status"] != "adverse":
+            raise ValidationError("athlete case requires an adverse sample")
+        if sample["data"].get("athlete_id") and sample["data"]["athlete_id"] != subject_id:
+            raise ValidationError("sample does not belong to the subject athlete")
 
 
 def _validate_report_adverse(actor, entity, data, lookup):
@@ -36,20 +81,64 @@ def _validate_report_adverse(actor, entity, data, lookup):
 def _validate_case_decision(actor, entity, data, lookup):
     if data.get("decision") not in ("sanction", "no_sanction"):
         raise ValidationError("decision must be sanction or no_sanction")
+    if data.get("decision") == "sanction":
+        start = _parse_date(data.get("start_date"), "start_date")
+        end = _parse_date(data.get("end_date"), "end_date")
+        if end < start:
+            raise ValidationError("end_date must not be earlier than start_date")
     return {"decided_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'athlete': _validate_athlete, 'sample': _validate_sample, 'case': _validate_case}
-CUSTOM_TRANSITIONS = {('sample', 'report_adverse'): _validate_report_adverse, ('case', 'decide'): _validate_case_decision, ('case', 'resolve_appeal'): _validate_case_decision}
+CUSTOM_CREATE = {
+    'athlete': _validate_athlete,
+    'team': _validate_team,
+    'personnel': _validate_personnel,
+    'sample': _validate_sample,
+    'case': _validate_case,
+}
+CUSTOM_TRANSITIONS = {
+    ('sample', 'report_adverse'): _validate_report_adverse,
+    ('case', 'decide'): _validate_case_decision,
+    ('case', 'resolve_appeal'): _validate_case_decision,
+}
 
 
 class RuleEngine:
-    ALIASES = {'athletes': 'athlete', 'samples': 'sample', 'cases': 'case'}
-    INITIAL_STATUS = {'athlete': 'active', 'sample': 'scheduled', 'case': 'open'}
+    ALIASES = {
+        'athletes': 'athlete',
+        'teams': 'team',
+        'personnel': 'personnel',
+        'staff': 'personnel',
+        'samples': 'sample',
+        'cases': 'case',
+        'sanctions': 'sanction',
+        'registrations': 'registration',
+    }
+    INITIAL_STATUS = {
+        'athlete': 'active',
+        'team': 'active',
+        'personnel': 'active',
+        'sample': 'scheduled',
+        'case': 'open',
+        'sanction': 'active',
+        'registration': 'confirmed',
+    }
     TRANSITIONS = {'athlete': {'retire': (('active',), 'retired')}, 'sample': {'collect': (('scheduled',), 'collected'), 'seal': (('collected',), 'sealed'), 'ship': (('sealed',), 'in_transit'), 'receive': (('in_transit',), 'received'), 'analyze': (('received',), 'analyzed'), 'report_adverse': (('analyzed',), 'adverse'), 'clear': (('analyzed',), 'cleared')}, 'case': {'provisional_suspend': (('open',), 'suspended'), 'schedule_hearing': (('suspended',), 'hearing'), 'decide': (('hearing',), 'closed'), 'appeal': (('closed',), 'appeal'), 'resolve_appeal': (('appeal',), 'closed')}}
-    CREATE_REQUIRED = {'athlete': ('name', 'discipline'), 'sample': ('athlete_id', 'sample_code', 'event'), 'case': ('athlete_id', 'sample_id', 'alleged_rule')}
+    CREATE_REQUIRED = {
+        'athlete': ('name', 'discipline'),
+        'team': ('name',),
+        'personnel': ('team_id', 'role', 'name'),
+        'sample': ('athlete_id', 'sample_code', 'event'),
+        'case': ('alleged_rule',),
+    }
     ACTION_REQUIRED = {('sample', 'collect'): ('collected_at',), ('sample', 'seal'): ('seal_id',), ('sample', 'ship'): ('carrier',), ('sample', 'receive'): ('lab_id',), ('sample', 'analyze'): ('result',), ('sample', 'clear'): ('reason',), ('case', 'provisional_suspend'): ('reason',), ('case', 'schedule_hearing'): ('hearing_at',), ('case', 'decide'): ('decision',), ('case', 'appeal'): ('grounds',), ('case', 'resolve_appeal'): ('decision',)}
-    CREATE_ROLES = {'athlete': ('admin', 'panel'), 'sample': ('admin', 'inspector'), 'case': ('admin', 'panel')}
+    CREATE_ROLES = {
+        'athlete': ('admin', 'panel'),
+        'team': ('admin', 'panel'),
+        'personnel': ('admin', 'panel'),
+        'sample': ('admin', 'inspector'),
+        'case': ('admin', 'panel'),
+    }
     ROLE_ACTIONS = {'retire': ('admin', 'panel'), 'collect': ('admin', 'inspector'), 'seal': ('admin', 'inspector'), 'ship': ('admin', 'inspector'), 'receive': ('admin', 'lab'), 'analyze': ('admin', 'lab'), 'report_adverse': ('admin', 'lab'), 'clear': ('admin', 'lab'), 'provisional_suspend': ('admin', 'panel'), 'schedule_hearing': ('admin', 'panel'), 'decide': ('admin', 'panel'), 'appeal': ('admin', 'panel'), 'resolve_appeal': ('admin', 'panel')}
 
     def normalize_kind(self, kind):
@@ -77,6 +166,10 @@ class RuleEngine:
         kind = self.normalize_kind(kind)
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
+        if kind in ("sanction", "registration"):
+            raise ValidationError(
+                kind + " is managed through its dedicated workflow endpoint"
+            )
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = CUSTOM_CREATE.get(kind)

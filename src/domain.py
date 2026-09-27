@@ -27,6 +27,14 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class EligibilityBlocked(ConflictError):
+    """Registration cannot be confirmed because an effective sanction applies."""
+
+    def __init__(self, message, items):
+        super().__init__(message)
+        self.items = items or []
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"

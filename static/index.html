@@ -6,28 +6,126 @@
   <title>反兴奋剂检测与结果管理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 980px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    button { padding: .45rem .8rem; cursor: pointer; }
+    input { padding: .4rem; border: 1px solid #d1d5db; border-radius: 6px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .panel { border: 1px solid #e5e7eb; border-radius: 10px; padding: 1rem; }
+    .panel h2 { margin-top: 0; font-size: 1.05rem; }
+    .ok { border-color: #86efac; }
+    .ok h2 { color: #15803d; }
+    .stop { border-color: #fca5a5; }
+    .stop h2 { color: #b91c1c; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { text-align: left; border-bottom: 1px solid #e5e7eb; padding: .35rem .25rem; vertical-align: top; }
+    .reason { color: #b91c1c; font-size: .82rem; }
+    .badge { display: inline-block; padding: 0 .4rem; border-radius: 999px; font-size: .75rem; }
+    .confirmed { background: #dcfce7; color: #166534; }
+    .invalidated { background: #fee2e2; color: #991b1b; }
+    .muted { color: #6b7280; font-size: .85rem; }
+    .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .5rem 0 1rem; }
   </style>
 </head>
 <body>
 <main>
-  <h1>反兴奋剂检测与结果管理</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
+  <h1>反兴奋剂：赛事报名资格核对</h1>
+  <p class="muted">报名时合并运动员本人、所属队伍及团队人员（队医/教练）的有效处罚，命中任一案件即拒绝确认。</p>
+
+  <div class="row">
+    <label>赛事 <input id="event" value="national-final"></label>
+    <label>比赛日期 <input id="event_date" type="date" value="2026-10-17"></label>
+    <button onclick="loadEligibility()">查询资格</button>
+    <button onclick="loadRegistrations()">刷新报名记录</button>
+    <button onclick="reconcile()">执行期满核对</button>
+  </div>
+  <div class="row">
+    <label>确认报名：运动员ID <input id="reg_athlete" placeholder="athlete id" size="36"></label>
+    <button onclick="confirmReg()">确认报名</button>
+  </div>
   <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+
+  <div class="grid">
+    <section class="panel ok">
+      <h2>✅ 可报名（无有效处罚）</h2>
+      <table><thead><tr><th>运动员</th><th>队伍</th><th>报名状态</th></tr></thead>
+      <tbody id="eligible"><tr><td colspan="3" class="muted">请先查询资格</td></tr></tbody></table>
+    </section>
+    <section class="panel stop">
+      <h2>⛔ 被挡原因（命中有效处罚）</h2>
+      <table><thead><tr><th>运动员</th><th>拦截事项</th></tr></thead>
+      <tbody id="blocked"><tr><td colspan="2" class="muted">请先查询资格</td></tr></tbody></table>
+    </section>
+  </div>
+
+  <h2>报名记录（原成绩始终保留）</h2>
+  <table><thead><tr><th>ID</th><th>运动员</th><th>赛事</th><th>存储状态</th><th>实时状态</th><th>成绩</th></tr></thead>
+  <tbody id="registrations"><tr><td colspan="6" class="muted">点击“刷新报名记录”</td></tr></tbody></table>
+
+  <h2 class="muted">接口入口</h2>
+  <pre>GET  /api/eligibility?event=&lt;赛事&gt;&event_date=&lt;YYYY-MM-DD&gt;   # 判定：可报名/被挡分开
+POST /api/registrations/confirm   {"athlete_id","event","event_date"}  # 报名确认闸门（409 返回 items）
+POST /api/registrations/reconcile  # 覆盖失效 / 期满恢复
+GET  /api/registrations?event=&lt;赛事&gt;                          # 报名记录</pre>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const headers = {"Content-Type": "application/json", "X-User-Id": "web", "X-Role": "admin"};
+function show(payload) {
+  document.getElementById('result').textContent = JSON.stringify(payload, null, 2);
+}
+async function getJson(url) {
+  const response = await fetch(url);
+  return [response.status, await response.json()];
+}
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+const SUBJECT_LABEL = {athlete: "运动员", team: "队伍", personnel: "团队人员"};
+function blockCell(blocks) {
+  return blocks.map(b => `<div class="reason">【${esc(SUBJECT_LABEL[b.subject_kind] || b.subject_kind)}】${esc(b.subject_name)}` +
+    ` 禁赛 ${esc(b.start_date)} ~ ${esc(b.end_date)}（案件 ${esc(b.case_id)}，条款 ${esc(b.reason)}）</div>`).join("");
+}
+async function loadEligibility() {
+  const event = document.getElementById('event').value.trim();
+  const dateValue = document.getElementById('event_date').value;
+  const [status, view] = await getJson(`/api/eligibility?event=${encodeURIComponent(event)}&event_date=${dateValue}`);
+  if (status !== 200) { show(view); return; }
+  document.getElementById('eligible').innerHTML = view.eligible.length ? view.eligible.map(a =>
+    `<tr><td>${esc(a.name)}</td><td>${esc(a.team_id || "—")}</td>` +
+    `<td>${a.registration_status ? `<span class="badge ${a.registration_status}">${a.registration_status}</span>` : "未报名"}</td></tr>`
+  ).join("") : `<tr><td colspan="3" class="muted">无可报名运动员</td></tr>`;
+  document.getElementById('blocked').innerHTML = view.blocked.length ? view.blocked.map(a =>
+    `<tr><td>${esc(a.name)}</td><td>${blockCell(a.blocks)}</td></tr>`
+  ).join("") : `<tr><td colspan="2" class="muted">无拦截事项</td></tr>`;
+  show(view);
+}
+async function confirmReg() {
+  const body = {
+    athlete_id: document.getElementById('reg_athlete').value.trim(),
+    event: document.getElementById('event').value.trim(),
+    event_date: document.getElementById('event_date').value
+  };
+  const response = await fetch('/api/registrations/confirm', {method: "POST", headers, body: JSON.stringify(body)});
+  const payload = await response.json();
+  show(payload);
+  if (response.ok) { await loadEligibility(); await loadRegistrations(); }
+}
+async function reconcile() {
+  const response = await fetch('/api/registrations/reconcile', {method: "POST", headers, body: "{}"});
+  show(await response.json());
+  await loadEligibility();
+  await loadRegistrations();
+}
+async function loadRegistrations() {
+  const event = document.getElementById('event').value.trim();
+  const [status, view] = await getJson(`/api/registrations?event=${encodeURIComponent(event)}`);
+  if (status !== 200) { show(view); return; }
+  document.getElementById('registrations').innerHTML = view.items.length ? view.items.map(r =>
+    `<tr><td>${esc(r.id.slice(0,8))}</td><td>${esc(r.athlete_name)}</td><td>${esc(r.event)}</td>` +
+    `<td><span class="badge ${r.status}">${r.status}</span></td>` +
+    `<td><span class="badge ${r.effective_status}">${r.effective_status}</span></td>` +
+    `<td>${esc(r.result ?? "—")}</td></tr>`
+  ).join("") : `<tr><td colspan="6" class="muted">暂无记录</td></tr>`;
 }
 </script>
 </body>
