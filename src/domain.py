@@ -11,6 +11,19 @@ class ValidationError(DomainError):
     """Input does not satisfy a domain rule."""
 
 
+class RegistrationBlocked(ValidationError):
+    """Effective sanctions block confirming the registration."""
+
+    def __init__(self, blockers):
+        self.blockers = list(blockers)
+        details = "; ".join(
+            "%s %s (%s ~ %s)"
+            % (b["subject_kind"], b["subject_name"], b["start_date"], b["end_date"])
+            for b in self.blockers
+        )
+        super().__init__("registration blocked by effective sanctions: " + details)
+
+
 class PermissionDenied(DomainError):
     """Actor is not allowed to perform the action."""
 

@@ -6,29 +6,164 @@
   <title>反兴奋剂检测与结果管理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    main { max-width: 880px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    select { padding: .4rem; }
+    .columns { display: flex; gap: 1rem; }
+    .panel { flex: 1; border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; }
+    .panel.ok { border-color: #10b981; }
+    .panel.blocked { border-color: #ef4444; }
+    .panel h3 { margin-top: 0; }
+    .panel.ok h3 { color: #047857; }
+    .panel.blocked h3 { color: #b91c1c; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; }
+    .reason { color: #b91c1c; font-size: .9rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>反兴奋剂检测与结果管理</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
+  <p><button onclick="checkHealth()">检查服务状态</button> <span id="health"></span></p>
+
+  <h2>报名资格核对</h2>
+  <p>
+    赛事：<select id="eventSelect"></select>
+    运动员：<select id="athleteSelect"><option value="">全部运动员</option></select>
+    <button onclick="runCheck()">核对资格</button>
+  </p>
+  <div class="columns">
+    <div class="panel ok"><h3>可报名</h3><ul id="okList"><li>尚未核对</li></ul></div>
+    <div class="panel blocked"><h3>被挡原因</h3><ul id="blockedList"><li>尚未核对</li></ul></div>
+  </div>
+
+  <h2>报名记录</h2>
+  <p>
+    <button onclick="loadRegistrations()">加载报名记录</button>
+    <button onclick="syncRegistrations()">按当前处罚同步</button>
+  </p>
+  <table>
+    <thead><tr><th>运动员</th><th>赛事</th><th>状态</th><th>成绩</th><th>操作</th></tr></thead>
+    <tbody id="regRows"><tr><td colspan="5">尚未加载</td></tr></tbody>
+  </table>
+
+  <h2>结果</h2>
   <pre id="result">等待操作</pre>
+
   <h2>常用接口</h2>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;   (athlete / team / personnel / sanction / event / registration ...)
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/eligibility?event_id=[&amp;athlete_id=]
+POST /api/eligibility/refresh</pre>
 </main>
 <script>
+const HEADERS = {"Content-Type": "application/json", "X-User-Id": "demo-admin", "X-Role": "admin"};
+let athletes = [], events = [];
+
 async function checkHealth() {
   const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  document.getElementById('health').textContent = JSON.stringify(await response.json());
 }
+
+async function loadOptions() {
+  const [a, e] = await Promise.all([
+    fetch('/api/athlete').then(r => r.json()),
+    fetch('/api/event').then(r => r.json()),
+  ]);
+  athletes = a.items || [];
+  events = e.items || [];
+  document.getElementById('eventSelect').innerHTML =
+    events.map(x => `<option value="${x.id}">${x.data.name || x.id} (${x.data.start_date || ''})</option>`).join('');
+  document.getElementById('athleteSelect').innerHTML =
+    '<option value="">全部运动员</option>' +
+    athletes.map(x => `<option value="${x.id}">${x.data.name || x.id}</option>`).join('');
+}
+
+function athleteName(id) { const a = athletes.find(x => x.id === id); return a ? (a.data.name || id) : id; }
+function eventName(id) { const e = events.find(x => x.id === id); return e ? (e.data.name || id) : id; }
+
+function blockerText(b) {
+  const kind = {athlete: '运动员', team: '队伍', personnel: '团队人员'}[b.subject_kind] || b.subject_kind;
+  return `${kind} ${b.subject_name} 处罚 ${b.start_date} ~ ${b.end_date}` + (b.reason ? `（${b.reason}）` : '');
+}
+
+async function runCheck() {
+  const eventId = document.getElementById('eventSelect').value;
+  const athleteId = document.getElementById('athleteSelect').value;
+  if (!eventId) { alert('请先创建赛事'); return; }
+  const url = '/api/eligibility?event_id=' + encodeURIComponent(eventId) +
+    (athleteId ? '&athlete_id=' + encodeURIComponent(athleteId) : '');
+  const data = await (await fetch(url)).json();
+  const okList = document.getElementById('okList');
+  const blockedList = document.getElementById('blockedList');
+  if (data.error) {
+    okList.innerHTML = '<li>—</li>';
+    blockedList.innerHTML = `<li class="reason">${data.error}</li>`;
+    return;
+  }
+  if (athleteId) {
+    okList.innerHTML = data.ok ? `<li>${athleteName(athleteId)}</li>` : '<li>—</li>';
+    blockedList.innerHTML = data.ok ? '<li>—</li>'
+      : data.blockers.map(b => `<li class="reason">${blockerText(b)}</li>`).join('');
+  } else {
+    okList.innerHTML = data.registrable.length
+      ? data.registrable.map(x => `<li>${x.name}</li>`).join('') : '<li>—</li>';
+    blockedList.innerHTML = data.blocked.length
+      ? data.blocked.map(x => `<li>${x.name}<ul>${x.blockers.map(b => `<li class="reason">${blockerText(b)}</li>`).join('')}</ul></li>`).join('')
+      : '<li>—</li>';
+  }
+}
+
+async function loadRegistrations() {
+  await loadOptions();
+  const eventId = document.getElementById('eventSelect').value;
+  const data = await (await fetch('/api/registration')).json();
+  const rows = (data.items || []).filter(r => !eventId || r.data.event_id === eventId);
+  document.getElementById('regRows').innerHTML = rows.length ? rows.map(r => `
+    <tr>
+      <td>${athleteName(r.data.athlete_id)}</td>
+      <td>${eventName(r.data.event_id)}</td>
+      <td>${r.status}</td>
+      <td>${r.data.result || ''}</td>
+      <td>
+        ${r.status === 'pending' ? `<button onclick="confirmReg('${r.id}', ${r.version})">确认</button>` : ''}
+        ${['confirmed', 'invalid'].includes(r.status) ? `<button onclick="refreshReg('${r.id}')">同步</button>` : ''}
+      </td>
+    </tr>`).join('') : '<tr><td colspan="5">暂无报名记录</td></tr>';
+}
+
+async function confirmReg(id, version) {
+  const response = await fetch('/api/entities/' + id + '/actions', {
+    method: 'POST', headers: HEADERS,
+    body: JSON.stringify({action: 'confirm', data: {}, expected_version: version}),
+  });
+  const data = await response.json();
+  document.getElementById('result').textContent = response.ok
+    ? '报名已确认'
+    : '拒绝确认：\n' + ((data.blockers || []).map(blockerText).join('\n') || data.error);
+  loadRegistrations();
+}
+
+async function refreshReg(id) {
+  await fetch('/api/eligibility/refresh', {
+    method: 'POST', headers: HEADERS, body: JSON.stringify({registration_id: id}),
+  });
+  loadRegistrations();
+}
+
+async function syncRegistrations() {
+  const eventId = document.getElementById('eventSelect').value;
+  await fetch('/api/eligibility/refresh', {
+    method: 'POST', headers: HEADERS, body: JSON.stringify(eventId ? {event_id: eventId} : {}),
+  });
+  loadRegistrations();
+}
+
+loadOptions();
 </script>
 </body>
 </html>
